@@ -3560,6 +3560,276 @@ trait MessagingBase
         ]);
     }
 
+    public function testUpdateScheduledSMS(): void
+    {
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ];
+        $userId = Id::unique();
+        $messageIds = [];
+
+        try {
+            // Test for SUCCESS
+            // An email-only user cannot resolve to an SMS recipient, even if a provider exists.
+            $user = $this->client->call(Client::METHOD_POST, '/users', $headers, [
+                'userId' => $userId,
+                'email' => $userId . '@example.com',
+                'password' => 'password',
+            ]);
+            $this->assertEquals(201, $user['headers']['status-code']);
+
+            $scheduledAt = DateTime::addSeconds(new \DateTime(), 30);
+            foreach (['cancelled', 'rescheduled', 'control'] as $name) {
+                $messageIds[$name] = Id::unique();
+                $message = $this->client->call(Client::METHOD_POST, '/messaging/messages/sms', $headers, [
+                    'messageId' => $messageIds[$name],
+                    'users' => [$userId],
+                    'content' => 'Scheduled message',
+                    'scheduledAt' => $scheduledAt,
+                ]);
+                $this->assertEquals(201, $message['headers']['status-code']);
+                $this->assertSame(MessageStatus::SCHEDULED, $message['body']['status']);
+                $this->assertNotNull($message['body']['scheduledAt']);
+                $this->assertSame(
+                    (new \DateTime($scheduledAt))->getTimestamp(),
+                    (new \DateTime($message['body']['scheduledAt']))->getTimestamp()
+                );
+            }
+
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['cancelled'], $headers, [
+                'content' => 'Updated before cancellation',
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::SCHEDULED, $message['body']['status']);
+            $this->assertSame('Updated before cancellation', $message['body']['data']['content']);
+
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['cancelled'], $headers, [
+                'draft' => true,
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+
+            $later = DateTime::addSeconds(new \DateTime(), 300);
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['rescheduled'], $headers, [
+                'scheduledAt' => $later,
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::SCHEDULED, $message['body']['status']);
+
+            // Wait for real scheduler/worker progress beyond the original due time.
+            $this->assertEventually(function () use ($headers, $messageIds) {
+                $control = $this->client->call(Client::METHOD_GET, '/messaging/messages/' . $messageIds['control'], $headers);
+                $this->assertEquals(200, $control['headers']['status-code']);
+                $this->assertContains($control['body']['status'], [MessageStatus::SENT, MessageStatus::FAILED]);
+            }, 60000, 500);
+
+            foreach (['cancelled' => MessageStatus::DRAFT, 'rescheduled' => MessageStatus::SCHEDULED] as $name => $status) {
+                $message = $this->client->call(Client::METHOD_GET, '/messaging/messages/' . $messageIds[$name], $headers);
+                $this->assertEquals(200, $message['headers']['status-code']);
+                $this->assertSame($status, $message['body']['status']);
+                $this->assertSame(0, $message['body']['deliveredTotal']);
+                $this->assertEmpty($message['body']['deliveryErrors']);
+                $this->assertSame(
+                    (new \DateTime($name === 'cancelled' ? $scheduledAt : $later))->getTimestamp(),
+                    (new \DateTime($message['body']['scheduledAt']))->getTimestamp()
+                );
+            }
+
+            // An inactive schedule in the past must not prevent editing or sending a draft.
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['cancelled'], $headers, [
+                'content' => 'Updated after the cancelled delivery time',
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+            $this->assertSame('Updated after the cancelled delivery time', $message['body']['data']['content']);
+
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['cancelled'], $headers, [
+                'draft' => false,
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::PROCESSING, $message['body']['status']);
+            $this->assertEventually(function () use ($headers, $messageIds) {
+                $message = $this->client->call(Client::METHOD_GET, '/messaging/messages/' . $messageIds['cancelled'], $headers);
+                $this->assertEquals(200, $message['headers']['status-code']);
+                $this->assertContains($message['body']['status'], [MessageStatus::SENT, MessageStatus::FAILED]);
+            }, 30000, 500);
+        } finally {
+            foreach ($messageIds as $messageId) {
+                $this->client->call(Client::METHOD_DELETE, '/messaging/messages/' . $messageId, $headers);
+            }
+            $this->client->call(Client::METHOD_DELETE, '/users/' . $userId, $headers);
+        }
+    }
+
+    public function testUpdateDraftSMSWithScheduledAt(): void
+    {
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $this->getProject()['$id'],
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ];
+        $messageId = Id::unique();
+
+        try {
+            // Test for SUCCESS
+            // Draft creation stores a date without creating an active delivery schedule.
+            $message = $this->client->call(Client::METHOD_POST, '/messaging/messages/sms', $headers, [
+                'messageId' => $messageId,
+                'content' => 'Draft message',
+                'draft' => true,
+                'scheduledAt' => DateTime::addSeconds(new \DateTime(), 300),
+            ]);
+            $this->assertEquals(201, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageId, $headers, [
+                'content' => 'Updated draft message',
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+            $this->assertSame('Updated draft message', $message['body']['data']['content']);
+
+            // Test for FAILURE
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageId, $headers, [
+                'draft' => false,
+            ]);
+            $this->assertEquals(400, $message['headers']['status-code']);
+            $this->assertSame('message_missing_target', $message['body']['type']);
+
+            $message = $this->client->call(Client::METHOD_GET, '/messaging/messages/' . $messageId, $headers);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+            $this->assertSame('Updated draft message', $message['body']['data']['content']);
+        } finally {
+            $this->client->call(Client::METHOD_DELETE, '/messaging/messages/' . $messageId, $headers);
+        }
+    }
+
+    public function testUpdateLegacyScheduledSMS(): void
+    {
+        $projectId = $this->getProject()['$id'];
+        $headers = [
+            'content-type' => 'application/json',
+            'x-appwrite-project' => $projectId,
+            'x-appwrite-key' => $this->getProject()['apiKey'],
+        ];
+        $userId = Id::unique();
+        $messageIds = [];
+        $scheduleIds = [];
+        $withDatabase = function (callable $callback) use ($projectId): void {
+            $run = function () use ($callback, $projectId): void {
+                global $register;
+                $authorization = new \Utopia\Database\Validator\Authorization();
+                $factory = $register->get('databaseFactory')(
+                    $register->get('pools'),
+                    $register->get('cache'),
+                    $authorization,
+                );
+                $platform = $factory->platform();
+                $authorization->skip(function () use ($callback, $projectId, $factory, $platform): void {
+                    $project = $platform->getDocument('projects', $projectId);
+                    $this->assertFalse($project->isEmpty());
+                    $callback($factory->project($project), $platform);
+                });
+            };
+            if (\Swoole\Coroutine::getCid() >= 0) {
+                $run();
+            } else {
+                \Swoole\Coroutine\run($run);
+            }
+        };
+
+        try {
+            // Test for SUCCESS
+            $user = $this->client->call(Client::METHOD_POST, '/users', $headers, [
+                'userId' => $userId,
+                'email' => $userId . '@example.com',
+                'password' => 'password',
+            ]);
+            $this->assertEquals(201, $user['headers']['status-code']);
+
+            $scheduledAt = DateTime::addSeconds(new \DateTime(), 300);
+            foreach (['cancelled', 'rescheduled'] as $name) {
+                $messageIds[$name] = Id::unique();
+                $message = $this->client->call(Client::METHOD_POST, '/messaging/messages/sms', $headers, [
+                    'messageId' => $messageIds[$name],
+                    'users' => [$userId],
+                    'content' => 'Legacy scheduled message',
+                    'scheduledAt' => $scheduledAt,
+                ]);
+                $this->assertEquals(201, $message['headers']['status-code']);
+            }
+
+            // Older SMS creation stored the schedule but omitted the message timestamp.
+            $withDatabase(function ($database, $platform) use ($messageIds, &$scheduleIds): void {
+                foreach ($messageIds as $name => $messageId) {
+                    $message = $database->getDocument('messages', $messageId);
+                    $scheduleIds[$name] = $message->getAttribute('scheduleId');
+                    $this->assertNotEmpty($scheduleIds[$name]);
+                    $schedule = $platform->getDocument('schedules', $scheduleIds[$name]);
+                    $this->assertTrue($schedule->getAttribute('active'));
+                    $database->updateDocument('messages', $messageId, new Document(['scheduledAt' => null]));
+                }
+            });
+
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['cancelled'], $headers, [
+                'draft' => true,
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::DRAFT, $message['body']['status']);
+            $this->assertSame(
+                (new \DateTime($scheduledAt))->getTimestamp(),
+                (new \DateTime($message['body']['scheduledAt']))->getTimestamp()
+            );
+
+            $later = DateTime::addSeconds(new \DateTime(), 600);
+            $message = $this->client->call(Client::METHOD_PATCH, '/messaging/messages/sms/' . $messageIds['rescheduled'], $headers, [
+                'scheduledAt' => $later,
+            ]);
+            $this->assertEquals(200, $message['headers']['status-code']);
+            $this->assertSame(MessageStatus::SCHEDULED, $message['body']['status']);
+
+            $withDatabase(function ($database, $platform) use ($projectId, $messageIds, $scheduleIds, $scheduledAt, $later): void {
+                foreach ($messageIds as $name => $messageId) {
+                    $message = $database->getDocument('messages', $messageId);
+                    $this->assertSame($scheduleIds[$name], $message->getAttribute('scheduleId'));
+                    $schedules = $platform->find('schedules', [
+                        Query::equal('projectId', [$projectId]),
+                        Query::equal('resourceId', [$messageId]),
+                    ]);
+                    $this->assertCount(1, $schedules);
+                    $this->assertSame($name === 'rescheduled', $schedules[0]->getAttribute('active'));
+                    $expected = $name === 'cancelled' ? $scheduledAt : $later;
+                    $this->assertSame(
+                        (new \DateTime($expected))->getTimestamp(),
+                        (new \DateTime($schedules[0]->getAttribute('schedule')))->getTimestamp()
+                    );
+                    $this->assertSame(
+                        (new \DateTime($expected))->getTimestamp(),
+                        (new \DateTime($message->getAttribute('scheduledAt')))->getTimestamp()
+                    );
+                }
+            });
+        } finally {
+            foreach ($messageIds as $messageId) {
+                $this->client->call(Client::METHOD_DELETE, '/messaging/messages/' . $messageId, $headers);
+            }
+            $withDatabase(function ($database, $platform) use ($projectId, $messageIds): void {
+                foreach ($messageIds as $messageId) {
+                    foreach ($platform->find('schedules', [
+                        Query::equal('projectId', [$projectId]),
+                        Query::equal('resourceId', [$messageId]),
+                    ]) as $schedule) {
+                        $platform->deleteDocument('schedules', $schedule->getId());
+                    }
+                }
+            });
+            $this->client->call(Client::METHOD_DELETE, '/users/' . $userId, $headers);
+        }
+    }
+
     public function testSendSMS(): void
     {
         if (empty(System::getEnv('_APP_MESSAGE_SMS_TEST_DSN'))) {

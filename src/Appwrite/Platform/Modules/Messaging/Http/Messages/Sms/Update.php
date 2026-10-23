@@ -123,8 +123,6 @@ class Update extends Action
             throw new Exception(Exception::MESSAGE_MISSING_TARGET);
         }
 
-        $currentScheduledAt = $message->getAttribute('scheduledAt');
-
         switch ($message->getAttribute('status')) {
             case MessageStatus::PROCESSING:
                 throw new Exception(Exception::MESSAGE_ALREADY_PROCESSING);
@@ -134,6 +132,17 @@ class Update extends Action
                 throw new Exception(Exception::MESSAGE_ALREADY_FAILED);
         }
 
+        $schedule = new Document();
+        $scheduleId = $message->getAttribute('scheduleId');
+        if (!empty($scheduleId)) {
+            $schedule = $dbForPlatform->getDocument('schedules', $scheduleId);
+            if ($schedule->isEmpty()) {
+                throw new Exception(Exception::SCHEDULE_NOT_FOUND);
+            }
+        }
+
+        $currentScheduledAt = $message->getAttribute('scheduledAt') ?? $schedule->getAttribute('schedule');
+
         if (
             $status === MessageStatus::SCHEDULED
             && \is_null($scheduledAt)
@@ -142,11 +151,25 @@ class Update extends Action
             throw new Exception(Exception::MESSAGE_MISSING_SCHEDULE);
         }
 
-        if (!\is_null($currentScheduledAt) && new \DateTime($currentScheduledAt) < new \DateTime()) {
+        if ($schedule->getAttribute('active', false) && !\is_null($currentScheduledAt) && new \DateTime($currentScheduledAt) < new \DateTime()) {
             throw new Exception(Exception::MESSAGE_ALREADY_SCHEDULED);
         }
 
-        if (\is_null($currentScheduledAt) && !\is_null($scheduledAt)) {
+        $updates = ['status' => $status];
+
+        if (!$schedule->isEmpty()) {
+            $changes = [
+                'projectInternalId' => $project->getSequence(),
+                'resourceUpdatedAt' => DateTime::now(),
+                'active' => $status === MessageStatus::SCHEDULED,
+            ];
+
+            if (!\is_null($scheduledAt)) {
+                $changes['schedule'] = $scheduledAt;
+            }
+
+            $dbForPlatform->updateDocument('schedules', $schedule->getId(), new Document($changes));
+        } elseif (!\is_null($scheduledAt)) {
             $schedule = $dbForPlatform->createDocument('schedules', new Document([
                 'region' => $project->getAttribute('region'),
                 'resourceType' => SCHEDULE_RESOURCE_TYPE_MESSAGE,
@@ -159,58 +182,32 @@ class Update extends Action
                 'active' => $status === MessageStatus::SCHEDULED,
             ]));
 
-            $message->setAttribute('scheduleId', $schedule->getId());
+            $updates['scheduleId'] = $schedule->getId();
         }
 
-        if (!\is_null($currentScheduledAt)) {
-            $schedule = $dbForPlatform->getDocument('schedules', $message->getAttribute('scheduleId'));
-            $scheduledStatus = ($status ?? $message->getAttribute('status')) === MessageStatus::SCHEDULED;
-
-            if ($schedule->isEmpty()) {
-                throw new Exception(Exception::SCHEDULE_NOT_FOUND);
-            }
-
-            $schedule
-                ->setAttribute('projectInternalId', $project->getSequence())
-                ->setAttribute('resourceUpdatedAt', DateTime::now())
-                ->setAttribute('active', $scheduledStatus);
-
-            if (!\is_null($scheduledAt)) {
-                $schedule->setAttribute('schedule', $scheduledAt);
-            }
-
-            $dbForPlatform->updateDocument('schedules', $schedule->getId(), $schedule);
-        }
-
-        if (!\is_null($scheduledAt)) {
-            $message->setAttribute('scheduledAt', $scheduledAt);
+        if (!\is_null($scheduledAt) || !\is_null($currentScheduledAt)) {
+            $updates['scheduledAt'] = $scheduledAt ?? $currentScheduledAt;
         }
 
         if (!\is_null($topics)) {
-            $message->setAttribute('topics', $topics);
+            $updates['topics'] = $topics;
         }
 
         if (!\is_null($users)) {
-            $message->setAttribute('users', $users);
+            $updates['users'] = $users;
         }
 
         if (!\is_null($targets)) {
-            $message->setAttribute('targets', $targets);
+            $updates['targets'] = $targets;
         }
-
-        $data = $message->getAttribute('data');
 
         if (!\is_null($content)) {
+            $data = $message->getAttribute('data');
             $data['content'] = $content;
+            $updates['data'] = $data;
         }
 
-        $message->setAttribute('data', $data);
-
-        if (!\is_null($status)) {
-            $message->setAttribute('status', $status);
-        }
-
-        $message = $dbForProject->updateDocument('messages', $message->getId(), $message);
+        $message = $dbForProject->updateDocument('messages', $message->getId(), new Document($updates));
 
         if ($status === MessageStatus::PROCESSING) {
             $publisherForMessaging->enqueue(new MessagingMessage(

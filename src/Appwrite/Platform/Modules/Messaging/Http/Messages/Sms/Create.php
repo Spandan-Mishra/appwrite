@@ -150,6 +150,7 @@ class Create extends Action
             'topics' => $topics,
             'users' => $users,
             'targets' => $targets,
+            'scheduledAt' => $scheduledAt,
             'data' => [
                 'content' => $content,
             ],
@@ -187,7 +188,7 @@ class Create extends Action
                 $dbForProject->updateDocument(
                     'messages',
                     $message->getId(),
-                    $message
+                    new Document(['scheduleId' => $schedule->getId()])
                 );
                 break;
             default:
